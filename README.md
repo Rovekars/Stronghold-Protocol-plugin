@@ -1,8 +1,9 @@
-# 卫戍协议：盟约 · Ausevay 改版
+# 卫戍协议：盟约 · Stronghold Protocol: Alliance
 
-> 基于 [sganggs/Stronghold-Protocol](https://github.com/sganggs/Stronghold-Protocol)（原版）的改版，由 B 站 UP 主 **Ausevay** 维护与增强。
+> 基于 [sganggs/Stronghold-Protocol](https://github.com/sganggs/Stronghold-Protocol)（原版）的**改版**，由 B 站 UP 主 **Ausevay** 维护与增强。
 > 原版玩法的一切都在：浏览器即开即玩的《明日方舟》「卫戍协议：盟约」同人复刻，单人或 1–4 人联机合作。
 
+![version](https://img.shields.io/badge/version-0.2.1-2ea44f)
 ![license](https://img.shields.io/badge/code%20license-GPL--3.0--or--later-blue)
 ![node](https://img.shields.io/badge/node-22%20%7C%2024-339933)
 
@@ -19,7 +20,17 @@
 
 ## 原版功能
 
-完整的一局流程（策略轮选 → 14 回合 → 结算称号）、4 种难度、112 名干员与 283 个技能、23 个盟约、装备与机变、自动作战（技能策略 / 阻挡接力 / 元素损伤）、联防、最终攻势与隐秘核心、断线重连、手机触屏支持等——细节见[原版 README](https://github.com/sganggs/Stronghold-Protocol#readme)。
+完整的一局流程（策略轮选 → 14 回合 → 结算称号）、4 种难度、112 名干员与 283 个技能、23 个盟约、装备与机变、自动作战（技能策略 / 阻挡接力 / 元素损伤）、联防、最终攻势与隐秘核心、断线重连、手机触屏支持等——细节见[原版 README](https://github.com/sganggs/Stronghold-Protocol#readme) 与 [CHANGELOG.md](CHANGELOG.md)。
+
+原版功能要点（沿袭自原版）：
+
+- **装备**：拖到干员格子上配发；已配发的装备锁定在干员身上，出售或合成精锐时退回整备区。
+- **机变选卡**：部分回合开始前有机变选卡（装备、资金、干员、层数、悬赏等），需要点两次确认。
+- **操作**：点选、拖放和配发装备都按地上的方格进行；漏怪时顶栏的目标生命值实时减少（结算时确定）。
+- **暂停（独立模拟）**：作战中可暂停 / 继续；同盟模拟的作战不能暂停。
+- **断线重连**：同盟模拟断线后 10 分钟内重新打开页面即可回到原座位，掉线期间按原阵容自动作战，也可以「暂离」交给 AI 托管；独立模拟 24 小时内可以回来继续（同一浏览器）。
+- **本地客户端素材（可选）**：官方 3D 棋盘、部分界面图标、灼热 / 炽焰源石虫和自选召唤物模型需从本机《明日方舟》客户端提取；没有客户端时用 2D 棋盘等替代样式，表情和「玩法说明」的教程图随上面的素材一起从公开镜像下载。没有客户端的服务器也可以从**同一版本**的整合包里复制 `public/assets/local/` 与 `data/local-assets.json`（见 [docs/DEPLOY.md](docs/DEPLOY.md) 第 6 节）。
+- **开发与测试**：`node --test` 运行约 3170 项单元与集成测试；游戏数据由 `npm run build-data` 从官方数据表生成。
 
 ## 快速开始
 
@@ -67,3 +78,7 @@ npm start          # 启动服务器：http://localhost:3000
 ## 许可证
 
 代码以 **GPL-3.0-or-later** 发布（[LICENSE](LICENSE)）；游戏素材不在许可范围内，使用限制见上方声明。
+
+## English
+
+An **unofficial, non-commercial fan remake** of Arknights' seasonal auto-chess tower-defense mode *Stronghold Protocol: Alliance*, played in the browser: solo, or 1–4 player co-op. This is a modified fork of [sganggs/Stronghold-Protocol](https://github.com/sganggs/Stronghold-Protocol) maintained by Bilibili uploader **Ausevay** — adding a jar-smashing (blind-box) game mode, a plugin & integration-pack system, and a full 2137-enemy pool (see the table above). Code: GPL-3.0-or-later; game assets excluded.
