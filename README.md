@@ -1,6 +1,6 @@
-# 卫戍协议：盟约 · Stronghold Protocol: Alliance
+# 卫戍协议：盟约 · Stronghold Protocol: Alliance（Ausevay 改版）
 
-《明日方舟》季节性自走棋塔防玩法「卫戍协议：盟约」的**非官方同人复刻**：浏览器即开即玩，单人或 1–4 人联机合作。
+《明日方舟》季节性自走棋塔防玩法「卫戍协议：盟约」的**非官方同人复刻**：浏览器即开即玩，单人或 1–4 人联机合作。本版本在原版基础上新增了**砸罐子（盲盒）玩法**、**插件与整合包系统**、**2137 种全量敌人池**等大量增强，见[下方改版特色](#改版特色)。
 
 > [!NOTE]
 > **项目来源 / Lineage**：本仓库是《卫戍协议：盟约》的一个**改版**，基于原生项目 [sganggs/Stronghold-Protocol](https://github.com/sganggs/Stronghold-Protocol) 由 B 站 UP 主 **Ausevay** 进行修改与增强。代码以 GPL-3.0-or-later 发布，游戏素材版权归原权利人所有（见下方声明）；原生项目的数据来源、素材清单与致谢同样适用于本改版。本仓库仅托管改版后的源码，不含原生仓库未授权的素材文件。
@@ -29,7 +29,7 @@ English summary: [below](#english).
 
 ## 目录
 
-- [声明](#声明) · [简介](#简介) · [功能一览](#功能一览)
+- [声明](#声明) · [简介](#简介) · [改版特色](#改版特色相对原生-sganggs-版本) · [功能一览](#功能一览)
 - [快速开始](#快速开始)：[整合包](#方式一整合包推荐) · [从源码运行](#方式二从源码运行) · [系统要求](#系统要求) · [端口与配置](#端口与配置) · [局域网联机](#和朋友一起玩局域网)
 - [联机方式](#联机方式) · [操作](#操作) · [文档](#文档) · [开发与测试](#开发与测试) · [项目结构](#项目结构)
 - [许可证](#许可证) · [致谢与数据来源](#致谢与数据来源) · [贡献](#贡献)
@@ -41,6 +41,16 @@ English summary: [below](#english).
 - **独立模拟**（单人）与**同盟模拟**（1–4 人**合作**，没有 PvP；空位可以加 AI 队友）。
 - 服务器是一个 Node.js 程序，**战斗在各玩家的浏览器里模拟**（和官方一样），服务器只管经济与回合，一台低功耗小主机就能开服。
 - 当前版本 0.2.1：联防改回在本回合的战场上进行，干员按满潜能计算，并修复了 0.2.0 发布后玩家和 GitHub 上反馈的问题；从这个版本起提供只含改动文件的更新包，详见 [CHANGELOG.md](CHANGELOG.md)。仍有少数规则按推断实现，与官方不一致的地方欢迎在 Issue 里反馈。
+
+## 改版特色（相对原生 sganggs 版本）
+
+- **砸罐子（盲盒）玩法**：一种全新的快节奏模式——所有敌人都装在罐子里，砸开罐子随机出现敌人、道具或干员；无休整期，全程边作战边砸罐、部署与穿装；敌人按回合与权重动态刷新（同盟模式更容易出怪），R10+ 出现超模大首领，漏过小型首领额外扣 5 点目标生命值并弹出击杀横幅。
+- **敌人数据全量**：可出场敌人从原版的 249 种扩展到 **2137 种**（按移动速度 / 评分 / 模型可用性自动归档分层），罐子池随回合数逐步解锁更多敌人。
+- **AI 队友真实作战**：AI 队友不再是空场摆设，会实际部署与作战；同盟模式下可以**随时点开队友的战场观战**，联防阶段也照常自由操作。
+- **战斗中自由操作**：砸罐子模式下晋升奖励可随时领取、装备可战斗中替换与退装、同名合成实时同步战斗单位、被击倒干员可主动撤离并保留再部署倒计时。
+- **插件与整合包系统**：`public/mod/` 下的插件即插即用，支持把多个 MOD 打包成**文件夹式整合包**（`pack.json` + 整体原子启停 + 冲突互斥），标题页插件面板分组管理，服务端钩子与客户端 UI 双端加载。
+
+其余功能与原版一致，见下一节「功能一览」。
 
 ## 功能一览
 
@@ -86,8 +96,8 @@ English summary: [below](#english).
 ### 方式二：从源码运行
 
 ```bash
-git clone https://github.com/Rovekars/Stronghold-Protocol-Ausevay.git
-cd Stronghold-Protocol-Ausevay
+git clone https://github.com/Rovekars/Stronghold-Protocol-plugin.git
+cd Stronghold-Protocol-plugin
 npm install        # 安装依赖（postinstall 会把 pixi / preact / three 复制到 public/vendor）
 npm run setup      # 检查环境，并从公开镜像下载约 460 MB 美术 / 音频（可中断，再次运行会续传）
 npm start          # 启动服务器：http://localhost:3000
@@ -247,7 +257,7 @@ GOLDEN_FULL=1 node --test test/golden.test.js           # 黄金结果：固定�
 
 ## English
 
-An **unofficial, non-commercial fan remake** of Arknights' seasonal auto-chess tower-defense mode *Stronghold Protocol: Alliance*, played in the browser: solo, or 1–4 player co-op (AI teammates can fill seats). Combat is simulated in each player's browser, so a low-power PC can host.
+An **unofficial, non-commercial fan remake** of Arknights' seasonal auto-chess tower-defense mode *Stronghold Protocol: Alliance*, played in the browser: solo, or 1–4 player co-op (AI teammates can fill seats). Combat is simulated in each player's browser, so a low-power PC can host. **This is a modified fork** of the original [sganggs/Stronghold-Protocol](https://github.com/sganggs/Stronghold-Protocol) maintained by Bilibili uploader **Ausevay**, adding a jar-smashing (blind-box) game mode, a plugin & integration-pack system, and a full 2137-enemy pool (see the "改版特色" section above for details).
 
 - **Run:** download the full bundle `Stronghold-Protocol-v<version>.zip` (~430 MB, all the art inside) from [Releases](../../releases/latest) — or the lite one, `…-lite.zip` (~22 MB), which downloads the art (~460 MB) on its first start; from 0.2.1 on, `…-update.zip` holds only the files changed since the earlier 0.2.x releases: stop the server, extract it over an existing 0.2.x folder and start again (the first start deletes the files the new version dropped and verifies the install) — install Node.js 22 or 24, then double-click `scripts\start-windows.bat` (Windows) or run `./scripts/start.sh` (macOS / Linux) and open <http://localhost:3000>. From source: `npm install && npm run setup && npm start` (setup downloads ~460 MB of art from public mirrors, the emotes and the how-to-play pages included; the official 3D board, some official HUD icons, two enemy models and 39 summon models are extracted from a local Arknights client — without one the game uses the 2D board and look-alike stand-ins (the summons show their avatars), and a server can copy `public/assets/local/` and `data/local-assets.json` from the full bundle of the same version).
 - **Languages:** Chinese (the default), English, 日本語, 한국어 and 繁體中文 — switch on the title screen or in Settings. Game texts come from the official clients; the Japanese, Korean and Traditional Chinese interface strings are machine translations (corrections welcome: [docs/I18N.md](docs/I18N.md)).
