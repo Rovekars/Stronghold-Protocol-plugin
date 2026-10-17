@@ -1,0 +1,610 @@
+// Client entry: boot (fonts, identity, socket), net → store wiring, router, global overlays.
+//
+// Router (derived from the store, no URL routes):
+//   not entered            → Title
+//   m.public.phase ≠ LOBBY → Game (screens/game.js: briefing / band draft / match / result by phase)
+//   room.inMatch           → Game (match starting, m.public on its way)
+//   in a room              → Room
+//   otherwise              → Lobby
+// Deep link `?room=CODE`: remembered at boot, auto-joined once the player has entered and the
+// session is online (after a short grace period in case the server restores a room on resume).
+// Reloading a tab that already passed the title re-enters automatically (sessionStorage flag) and
+// resumes the server session with the saved token; stale room/match state is dropped if the
+// server does not re-push it within RESTORE_GRACE_MS after `welcome`. Boot waits for
+// `identity.init()` (which token this tab may use without stealing another live tab's session)
+// before the first connect; a page restored from the back/forward cache reloads.
+// A `welcome` with a NEW playerId (the server restarted / the session expired) while a room or match was on screen:
+// toast 「服务器会话已重置，上一局模拟已结束」 (store.js sessionResetNotice) and return to the lobby with nothing stale.
+//
+// Shared modules are imported relatively ('../../shared/…' resolves to /shared/… in the browser).
+// Multi-device support (ui/device.js + css/devices.css): feature classes on <html>, no page zoom, safe areas, rotation
+// re-layout; ui/compat.js polyfills are imported before anything else.
+// 干员调配 (DESIGN §16): an overlay over any route (<LoadoutHost/>, opened from lobby / room / briefing); its loadout is
+// kept in sync with the server by installLoadoutSync (room.loadout after every welcome and edit), its 干员持有 tab's
+// not-owned list (0.2.0 补位) by installOwnershipSync (room.ownership, likewise), the 自选编队 picks (0.2.0 DIY) by
+// installDiySync (room.diy, likewise; it also keeps welcome.diyKitted for the picker).
+// Game data: every text of the game is static data (/data/*.json) downloaded once per page; the in-match files are
+// warmed in the background as soon as the player is in a room (warmGameData), before the match needs them.
+// Language (ui/lang.js, docs/I18N.md): chosen before the first render (initLang); App re-renders on a switch (useLang).
+// Server texts are translated on arrival: m.toast / m.ticker frames (msgid + params, or the text as a msgid; a
+// config.broadcasts line from its id + args), error codes (ui/toasts.js describeError) and room.closed reasons.
+
+// Polyfills first (older Safari / Firefox ESR): every module evaluated after this one sees them.
+import './ui/compat.js';
+import { render, h } from '../vendor/preact.module.js';
+import { useErrorBoundary, useState, useEffect } from '../vendor/hooks.module.js';
+import { html, UiHosts, Button, MicroLabel, closeAllDialogs } from './ui/components.js';
+import { ConnectionBanner } from './ui/connBanner.js';
+import { ToastHost, toast, toastError, describeError } from './ui/toasts.js';
+import { net, identity, NetError } from './net.js';
+import { store, useStore, emptyMatch, selectRoute, sessionResetNotice, isSpectating } from './store.js';
+import { data } from './data.js';
+import { GAME_FILES } from './ui/gameComponents.js';
+import { TitleScreen, sanitizeName } from './screens/title.js';
+import { LobbyScreen, rememberRoom, parseRoomParam } from './screens/lobby.js';
+import { RoomScreen } from './screens/room.js';
+import { GameScreen } from './screens/game.js';
+import { installAudio, setBgmOverride, refreshBgm } from './audio.js';
+import { settingsStore } from './ui/settings.js';
+import { GuideHost } from './ui/guide.js';
+import { installDeviceSupport } from './ui/device.js';
+import { modsOffMap, isModOff, setModOff, setModConflicts, modConflicts, onModsChanged, userMods, registerPacks, isPackOff } from './ui/mods.js';
+import { registerSettingsEntry, unregisterSettingsEntries } from './ui/settings.js';
+import { registerCustomEmotes, unregisterCustomEmotes } from './ui/emotes.js';
+import { LoadoutHost, registerLoadoutAction, unregisterLoadoutActions, registerDetailAction, unregisterDetailActions } from './screens/loadout.js';
+import { registerLobbyEntry, unregisterLobbyEntries } from './screens/lobby.js';
+import { registerShopOverride, unregisterShopOverrides } from './ui/shopBar.js';
+import { installLoadoutSync, installOwnershipSync, installDiySync } from './ui/loadoutSync.js';
+import { startBuildGuard } from './ui/buildGuard.js';
+import { initLang, useLang, tickerText } from './ui/lang.js';
+import { t, N_, translateWire } from '../../shared/i18n.js';
+import { C2S } from '../../shared/protocol.js';
+
+const RESTORE_GRACE_MS = 1500;
+const JOIN_DELAY_MS = 350;
+const TICKER_KEEP = 20;
+const EMOTE_KEEP = 20;
+
+const SCREENS = { title: TitleScreen, lobby: LobbyScreen, room: RoomScreen, game: GameScreen };
+
+// ---- MOD / plugin system -------------------------------------------------------------------------
+// Drop a `.js` file into `mod/` (or a folder with `index.js`) and re-enter the page:
+// the server lists them at /mod/manifest.json and this loader imports each one. A plugin's
+// default export is either a setup function `(api) => meta?` or an object
+// `{ id?, name?, version?, author?, description?, setup(api) }`. Failures are isolated per-plugin
+// so one broken mod never takes down the app or the others. See public/mod/README.md.
+
+const pluginOverlays = []; // { id, C } — id is the registering plugin's manifest id (per-plugin unload)
+let notifyOverlays = () => {};
+/** Drop a MOD's registered overlays (a re-activation must not render its UI twice). */
+function unregisterOverlays(modId) {
+  let removed = false;
+  for (let i = pluginOverlays.length - 1; i >= 0; i--) {
+    if (pluginOverlays[i].id === modId) { pluginOverlays.splice(i, 1); removed = true; }
+  }
+  if (removed) notifyOverlays();
+}
+
+// MOD 音乐盒: the BGM source a plugin installed, kept per MOD so 卸下 hides its music like its overlays, and so a
+// re-activation (or a second music mod) replaces it instead of stacking.
+const bgmOverrides = new Map(); // modId → fn({ key, track }) → { intro?, loop } | null
+function syncBgmOverride() {
+  const off = modsOffMap();
+  let fn = null;
+  for (const [id, f] of bgmOverrides) if (!off[id]) fn = f;
+  setBgmOverride(fn);
+}
+onModsChanged(syncBgmOverride);
+
+/** A per-plugin view of the shared API: overlays remember which MOD registered them (ui/mods.js). */
+function makePluginApi(meta) {
+  return Object.create(PLUGIN_API, {
+    registerOverlay: {
+      value(Component) { pluginOverlays.push({ id: meta.id, C: Component }); notifyOverlays(); },
+    },
+    /** Hang a row in the game's 设置 dialog (ui/settings.js): { id, label, micro?, Panel? }. */
+    registerSettingsEntry: {
+      value(entry) { registerSettingsEntry({ ...entry, modId: meta.id }); },
+    },
+    /** Add an extra 自定义 page to the in-match 交流 panel (ui/emotes.js): get() → [{ id: dataURL, name? }]. */
+    registerCustomEmotes: {
+      value(get) { registerCustomEmotes(meta.id, get); },
+    },
+    /** Add a button to the loadout header: { id, label, icon?, onClick, variant?, size?, title?, order? }. */
+    registerLoadoutAction: {
+      value(entry) { registerLoadoutAction({ ...entry, modId: meta.id }); },
+    },
+    /** Remove this MOD's buttons from the loadout header (used to refresh a toggled label / icon). */
+    unregisterLoadoutActions: { value() { unregisterLoadoutActions(meta.id); } },
+    /** Add a button to the operator detail dialog header (left of 恢复默认): { id, label, icon?, onClick(chess), … }. */
+    registerDetailAction: {
+      value(entry) { registerDetailAction({ ...entry, modId: meta.id }); },
+    },
+    /** Add a card under the lobby's 01 模拟方式 mode cards: { id, Component } (the component owns its state). */
+    registerLobbyEntry: {
+      value(entry) { registerLobbyEntry({ ...entry, modId: meta.id }); },
+    },
+    /** Replace the match's shop bar: { id, Component } — Component gets the default <ShopBar> props; rendering
+        <${ShopBar} …props/> (imported from ui/shopBar.js) keeps the official bar, anything else replaces it. */
+    registerShopOverride: {
+      value(entry) { registerShopOverride({ ...entry, modId: meta.id }); },
+    },
+    /**
+     * Replace the game's BGM: `fn({ key, track })` → `{ intro?, loop }` to play instead, `null` to keep the game's
+     * own track for that key. `fn(null)` gives the music back. Call `api.refreshBgm()` after the track changed.
+     */
+    setBgmOverride: {
+      value(fn) {
+        if (typeof fn === 'function') bgmOverrides.set(meta.id, fn); else bgmOverrides.delete(meta.id);
+        syncBgmOverride();
+      },
+    },
+    /** Re-resolve the BGM after the override's answer changed (next track, pause, …). */
+    refreshBgm: { value() { refreshBgm(); } },
+  });
+}
+
+/** Shared activation of a plugin module's default export (manifest MODs and local MODs alike). */
+async function activatePlugin(importPromise, meta) {
+  const mod = await importPromise;
+  const def = mod && mod.default;
+  // 稳定 id：MOD 可用 `export const id = 'xxx'` 声明，缺省才回落文件名。文件重命名（如改成中文名）时
+  // 已保存的「启用 / 卸下」状态与本体的 modId 清理才不会错位。
+  if (mod && typeof mod.id === 'string' && mod.id) meta.id = mod.id;
+  const api = makePluginApi(meta);
+  unregisterSettingsEntries(meta.id); // a re-activation must not pile up duplicate 设置 rows
+  unregisterCustomEmotes(meta.id);
+  unregisterLoadoutActions(meta.id);  // remove stale loadout buttons before the new setup runs
+  unregisterDetailActions(meta.id);   // …and stale detail-dialog buttons
+  unregisterLobbyEntries(meta.id);    // …and stale lobby cards
+  unregisterOverlays(meta.id);        // …and stale global overlays
+  unregisterShopOverrides(meta.id);   // …and a stale shop-bar override (the FIRST registered one wins)
+  bgmOverrides.delete(meta.id);       // …nor keep an old BGM override alive (the new setup installs its own)
+  if (typeof def === 'function') {
+    const r = def(api) || {};
+    if (r && typeof r === 'object') Object.assign(meta, r);
+  } else if (def && typeof def === 'object') {
+    Object.assign(meta, def);
+    if (typeof def.setup === 'function') def.setup(api);
+  }
+}
+
+/** The API handed to every plugin's setup(). @type {object} */
+const PLUGIN_API = {
+  version: 2,
+  store, // { get(), set(), patch(), subscribe() }
+  net, // the socket/net module
+  data, // the game-data module
+  html, // htm template tag bound to preact (write html`<div>…</div>`)
+  h, // preact createElement
+  t, // translator: t('msgid', params?) → current-language string
+  toast, // toast(msg, kind?, opts?) — surface a message
+  /**
+   * Register a MOD-owned C2S message schema: `registerMessage('g.myThing', { field: (v) => ok })`.
+   * net.request / net.send validate against the shared C2S catalogue **in the browser**, so a MOD that adds its own
+   * message must register it on this side too (the server side does the same through server/mods.js). Without this
+   * the client refuses its own message locally with 无效的请求 and it never reaches the server.
+   */
+  registerMessage(name, schema) {
+    if (typeof name === 'string' && name && schema && typeof schema === 'object') C2S[name] = schema;
+  },
+  /** Register a global overlay component (may use hooks); rendered above everything else. */
+  registerOverlay(Component) { pluginOverlays.push(Component); notifyOverlays(); },
+};
+
+/**
+ * Discover and load user plugins from /mod.
+ * @returns {Promise<void>}
+ */
+async function loadPlugins() {
+  let manifest;
+  try {
+    const res = await fetch('/mod/manifest.json', { cache: 'no-store' });
+    if (!res.ok) return;
+    manifest = await res.json();
+  } catch (err) {
+    console.warn('[plugins] manifest fetch failed', err);
+    return;
+  }
+  const list = (manifest && Array.isArray(manifest.plugins)) ? manifest.plugins : [];
+  const packs = (manifest && Array.isArray(manifest.packs)) ? manifest.packs : [];
+  const loaded = [];
+  const loadOne = async (entry, meta) => {
+    try {
+      await activatePlugin(import(/* @vite-ignore */ entry.file), meta);
+      console.info(`[plugins] loaded "${meta.name || meta.id}"${meta.version ? ' v' + meta.version : ''}`);
+    } catch (err) {
+      console.error('[plugins] failed to load', entry.file, err);
+      meta.error = String((err && err.message) || err);
+    }
+    loaded.push(meta);
+  };
+  // Standalone MODs (not part of any 整合包).
+  for (const p of list) {
+    await loadOne(p, { id: p.id || p.file, file: p.file, name: p.id || p.file, version: '', author: '', description: '' });
+  }
+  // 整合包成员：每个 member 是普通 MOD（有自己的 setup / 服务端半边），只是被 pack.json 分组；meta 打上 pack 标记，
+  // 让标题页 MOD 面板把它们归到对应包下，而不是当成独立插件散列。
+  for (const pack of packs) {
+    for (const m of (pack.members || [])) {
+      await loadOne(m, { id: m.id || m.file, file: m.file, name: m.id || m.file, version: '', author: '', description: '', pack: pack.id, packName: pack.name });
+    }
+  }
+  // Locally added MODs (title screen MOD manager → ui/mods.js): imported from a Blob URL after
+  // the server manifest, so the player's own MODs survive a reload without touching the server.
+  for (const entry of userMods()) {
+    const meta = { id: entry.id, file: t('(本地添加)'), name: entry.name, version: '', author: '', description: '', user: true };
+    try {
+      const url = URL.createObjectURL(new Blob([entry.code], { type: 'text/javascript' }));
+      try { await activatePlugin(import(/* @vite-ignore */ url), meta); } finally { URL.revokeObjectURL(url); }
+      console.info(`[plugins] loaded local "${meta.name || meta.id}"${meta.version ? ' v' + meta.version : ''}`);
+    } catch (err) {
+      console.error('[plugins] failed to load local mod', entry.name, err);
+      meta.error = String((err && err.message) || err);
+    }
+    loaded.push(meta);
+  }
+  // MOD 互斥：插件用 `conflicts: ['otherId']` 声明「不能同时启用」，这里一次性登记给 ui/mods.js（对称生效），
+  // 之后任何路径的启用都会自动卸下冲突方。整合包用 pack.id 声明 `conflicts`，与 MOD 共用同一套互斥表。
+  const conflicts = {};
+  for (const m of loaded) if (Array.isArray(m.conflicts) && m.conflicts.length) conflicts[m.id] = m.conflicts;
+  const packList = packs.map((p) => ({ id: p.id, memberIds: (p.members || []).map((m) => m.id), conflicts: p.conflicts }));
+  // 整合包原子启停：登记成员与包级冲突，并把每个包的总开关状态同步到其成员（避免出现「包开了但成员关着」的分裂态）。
+  registerPacks(packList, conflicts);
+  for (const pack of packList) {
+    const off = isPackOff(pack.id);
+    for (const mid of pack.memberIds) if (isModOff(mid) !== off) setModOff(mid, off);
+  }
+  for (const m of loaded) {
+    if (isModOff(m.id)) continue;
+    for (const other of modConflicts(m.id)) if (!isModOff(other)) setModOff(other, true);
+  }
+  if (globalThis.__SP__) globalThis.__SP__.plugins = loaded;
+  store.patch('ui', { plugins: loaded, packs: packList });
+}
+
+/** Renders every plugin-registered overlay component, skipping unloaded (卸下) MODs (ui/mods.js). */
+function PluginOverlays() {
+  const [off, setOff] = useState(modsOffMap);
+  useEffect(() => onModsChanged(() => setOff({ ...modsOffMap() })), []);
+  return html`${pluginOverlays.map((o, i) => (off[o.id] ? null : html`<${o.C} key=${i} api=${PLUGIN_API} />`))}`;
+}
+
+/** Copy of a server message without transport fields. */
+function payload(msg) {
+  const { t: _t, rid: _rid, ...rest } = msg;
+  return rest;
+}
+
+function clearRoomParam() {
+  try {
+    const url = new URL(location.href);
+    if (!url.searchParams.has('room')) return;
+    url.searchParams.delete('room');
+    history.replaceState(history.state, '', url.pathname + (url.search || '') + url.hash);
+  } catch { /* ignore */ }
+}
+
+// ---- net → store wiring ---------------------------------------------------------------------------
+
+let seq = 0;
+let welcomeAt = 0;
+let roomStateAt = 0;
+let matchAt = 0;
+let restoreTimer = null;
+let joinTimer = null;
+let joinInFlight = false;
+
+function clearPendingJoin() {
+  store.patch('ui', { pendingJoin: null });
+  clearRoomParam();
+}
+
+/** Auto-join the deep-linked room once entered + online (idempotent). */
+function schedulePendingJoin() {
+  clearTimeout(joinTimer);
+  joinTimer = setTimeout(async () => {
+    const s = store.get();
+    const code = s.ui.pendingJoin;
+    if (!code || joinInFlight || !s.session.entered || net.status !== 'online') return;
+    if (s.room) {
+      if (s.room.code !== code) toast(t('你已在其他同盟中，请先离开当前同盟'), 'warn');
+      clearPendingJoin();
+      return;
+    }
+    joinInFlight = true;
+    try {
+      await net.request('room.join', { code });
+    } catch (err) {
+      toastError(err);
+    } finally {
+      joinInFlight = false;
+      clearPendingJoin();
+    }
+  }, JOIN_DELAY_MS);
+}
+
+/** End the post-resume "syncing" state early once the server re-pushed what we were showing. */
+function maybeFinishRestore() {
+  const s = store.get();
+  if (!s.ui.restoring) return;
+  const roomOk = !s.room || roomStateAt >= welcomeAt;
+  const matchOk = !s.match.public || matchAt >= welcomeAt || !s.room?.inMatch;
+  if (roomOk && matchOk) {
+    clearTimeout(restoreTimer);
+    store.patch('ui', { restoring: false });
+  }
+}
+
+/**
+ * Leave whatever room / match was on screen for the lobby with nothing stale left behind: open imperative dialogs,
+ * the post-resume restore timer, ticker lines and emote bubbles of the old match (the battle runner and the 暂离 flag
+ * follow the store themselves).
+ */
+function backToLobby() {
+  clearTimeout(restoreTimer);
+  const s = store.get();
+  if (s.room || s.match.public) closeAllDialogs();
+  store.set({ room: null, match: emptyMatch(), ticker: [], emotes: [] });
+  store.patch('ui', { restoring: false });
+}
+
+function onWelcome(msg) {
+  identity.saveToken(msg.token);
+  const prev = store.get();
+  const prevId = prev.me.playerId;
+  const name = typeof msg.name === 'string' && msg.name ? msg.name : prev.me.name;
+  store.set({ me: { playerId: msg.playerId ?? null, name, token: typeof msg.token === 'string' ? msg.token : null } });
+  welcomeAt = Date.now();
+
+  if (prevId != null && prevId !== msg.playerId) {
+    // A brand-new server session (the server restarted — crashed / killed, so no room.closed arrived — or this session
+    // expired on it): whatever we showed before is gone — back to the lobby cleanly and say why.
+    const notice = sessionResetNotice(prev, msg.playerId);
+    backToLobby();
+    if (notice) toast(t(notice), 'warn', { ttl: 7000 });
+  } else if (prev.room || prev.match.public) {
+    // Resumed session: the server re-pushes room/match state; drop whatever it doesn't.
+    store.patch('ui', { restoring: true });
+    clearTimeout(restoreTimer);
+    restoreTimer = setTimeout(() => {
+      const s = store.get();
+      const patch = {};
+      if (s.room && roomStateAt < welcomeAt) patch.room = null;
+      if (s.match.public && matchAt < welcomeAt) patch.match = emptyMatch();
+      store.set(patch);
+      store.patch('ui', { restoring: false });
+    }, RESTORE_GRACE_MS);
+  }
+  schedulePendingJoin();
+}
+
+function onRoomState(msg) {
+  const room = payload(msg);
+  roomStateAt = Date.now();
+  const myId = store.get().me.playerId;
+  const seats = Array.isArray(room.seats) ? room.seats : [];
+  if (myId != null && seats.length && !seats.some((s) => s && s.playerId === myId) && !isSpectating(room, myId)) {
+    // We are no longer seated (kicked / left elsewhere) — neither in a player seat nor a spectator seat.
+    if (store.get().room) toast(t('你已不在该同盟中'), 'warn');
+    store.set({ room: null, match: emptyMatch() });
+    return;
+  }
+  const prevRoom = store.get().room;
+  // A (new) match starts: forget the previous match's state so stale results never show.
+  if (room.inMatch && !(prevRoom && prevRoom.inMatch && prevRoom.code === room.code)) store.set({ match: emptyMatch() });
+  store.set({ room });
+  if (room.mode === 'coop' && typeof room.code === 'string') rememberRoom(room.code);
+  maybeFinishRestore();
+}
+
+const CLOSE_REASON = {
+  // 'timeout' = this player was removed after staying disconnected past the lobby grace (server/lobby.js)
+  host_left: N_('创建者已离开，同盟已解散'), timeout: N_('由于长时间断开连接，你已离开同盟'), empty: N_('同盟已解散'),
+  kicked: N_('你已被移出同盟'), ended: N_('模拟已结束'), expired: N_('同盟已过期'), shutdown: N_('服务器维护中，同盟已关闭'),
+};
+
+function wireNet() {
+  net.on('status', (snap) => {
+    const cur = store.get().connection;
+    store.set({
+      connection: {
+        status: snap.status, ping: snap.ping, attempt: snap.attempt, retryAt: snap.retryAt,
+        lastError: snap.lastError, everOnline: cur.everOnline || snap.status === 'online',
+      },
+    });
+  });
+  net.on('clock', (c) => store.set({ clock: { offset: c.offset, rtt: c.rtt, synced: c.synced } }));
+  net.on('welcome', onWelcome);
+  net.on('helloError', (err) => toastError(err));
+  net.on('replaced', () => toast(t('该身份已在其他页面登录，本页已断开'), 'warn', { ttl: 6000 }));
+  net.on('unhandledError', (err) => toastError(err));
+  net.on('room.state', onRoomState);
+  net.on('room.closed', (msg) => {
+    backToLobby();
+    const known = Object.hasOwn(CLOSE_REASON, String(msg.reason)) ? CLOSE_REASON[msg.reason] : null;
+    toast(known ? t(known) : typeof msg.reason === 'string' && msg.reason.length < 60 ? t('同盟已关闭：{reason}', { reason: msg.reason }) : t('同盟已关闭'), 'warn');
+  });
+  net.on('m.public', (msg) => { matchAt = Date.now(); store.patch('match', { public: payload(msg) }); maybeFinishRestore(); });
+  net.on('m.private', (msg) => { matchAt = Date.now(); store.patch('match', { private: payload(msg) }); });
+  net.on('m.field', (msg) => store.patch('match', { field: payload(msg) }));
+  net.on('m.result', (msg) => store.patch('match', { result: payload(msg) }));
+  net.on('m.toast', (msg) => {
+    const kind = ['info', 'success', 'warn', 'error'].includes(msg.kind) ? msg.kind : 'info';
+    // msgid + params (server ≥ 0.2.0) or the text itself as a msgid, in the current language
+    toast(translateWire(msg), kind);
+  });
+  net.on('m.ticker', (msg) => {
+    if (typeof msg.text !== 'string') return;
+    const text = tickerText(msg);
+    // type, player + the round it came in: a BOSS_HIT line is dropped once its boss round is over and superseded by the
+    // same player's next one (ui/ticker.js tickerLineLive / tickerSupersedes)
+    const type = typeof msg.type === 'string' ? msg.type : null;
+    const playerId = typeof msg.playerId === 'string' ? msg.playerId : null;
+    // its broadcast priority: the strip plays the highest first (ui/ticker.js enqueueTickerLines)
+    const priority = Number.isFinite(msg.priority) ? msg.priority : 0;
+    store.set((s) => ({ ticker: [...s.ticker.slice(-(TICKER_KEEP - 1)), { id: ++seq, text, at: Date.now(), type, playerId, round: s.match?.public?.round ?? null, priority }] }));
+  });
+  net.on('m.emote', (msg) => {
+    store.set((s) => ({ emotes: [...s.emotes.slice(-(EMOTE_KEEP - 1)), { seq: ++seq, playerId: msg.playerId, id: msg.id, at: Date.now() }] }));
+  });
+  // custom emote (MOD "自定义表情包"): the same team-panel bubble flow as m.emote, but the id is the picture's data
+  // URL itself — EmoteArt renders data: URLs directly (EmoteBubble keys by seq, so one shot replaces the previous).
+  net.on('m.customEmote', (msg) => {
+    if (typeof msg.data !== 'string' || !msg.data.startsWith('data:image/')) return;
+    store.set((s) => ({ emotes: [...s.emotes.slice(-(EMOTE_KEEP - 1)), { seq: ++seq, playerId: msg.playerId, id: msg.data, at: Date.now() }] }));
+  });
+
+  // Entering (title → lobby) while already online also needs the deep-link join.
+  store.subscribe((s, prev) => {
+    if (s.session.entered && !prev.session.entered) schedulePendingJoin();
+    // in a room (co-op or solo, also a resumed one) a match is near: its data starts downloading
+    if (s.room && !prev.room) warmGameData();
+  });
+}
+
+/**
+ * Download every data file of the match UI (gameComponents GAME_FILES: operators, skills, bonds, items, enemies, 特质 …)
+ * in the background once the player is in a room — a match is near (the lobby alone never downloads them). The game's
+ * texts are static data loaded once per page — never fetched during a match — and the match screen waits for these
+ * files, so with them warmed it opens at once and no text ever appears late (user playtest #3 item 9). Idempotent (the
+ * data store shares each file's promise).
+ */
+function warmGameData() {
+  const go = () => { data.loadAll(GAME_FILES).catch(() => {}); };
+  if (typeof globalThis.requestIdleCallback === 'function') globalThis.requestIdleCallback(go, { timeout: 2500 });
+  else setTimeout(go, 600);
+}
+
+// ---- UI chrome (the connection banner lives in ui/connBanner.js) -----------------------------------
+
+function ScreenCrashed({ error, reset }) {
+  return html`<div class="screen crash">
+    <div class="crash__box brackets">
+      <${MicroLabel} tone="mint">SYSTEM FAULT<//>
+      <h2>${t('界面发生错误')}</h2>
+      <p class="t-lo">${String(error?.message || error).slice(0, 200)}</p>
+      <${Button} variant="primary" icon="refresh" onClick=${reset}>${t('重新加载界面')}<//>
+    </div>
+  </div>`;
+}
+
+function App() {
+  const route = useStore(selectRoute);
+  useLang(); // a language switch re-renders the whole tree in place
+  const [error, resetError] = useErrorBoundary((err) => console.error('[ui] screen crashed', err));
+  const [, setBump] = useState(0);
+  // Plugins register overlays from loadPlugins() (which runs after the first render); this lets the
+  // freshly registered components appear without a manual reload.
+  notifyOverlays = () => setBump((b) => b + 1);
+  const Screen = SCREENS[route] || LobbyScreen;
+  return html`<div class="app-root">
+    <div class="app-bg" aria-hidden="true"></div>
+    ${error ? html`<${ScreenCrashed} error=${error} reset=${resetError} />` : html`<${Screen} key=${route} />`}
+    <${ConnectionBanner} />
+    <${ToastHost} />
+    <${UiHosts} />
+    <${GuideHost} />
+    <${LoadoutHost} />
+    <${PluginOverlays} />
+  </div>`;
+}
+
+// ---- boot -----------------------------------------------------------------------------------------
+
+async function waitForFonts(ms) {
+  const fonts = document.fonts;
+  if (!fonts || typeof fonts.load !== 'function') return;
+  const loads = [
+    fonts.load('900 1em "Noto Sans SC"', '卫戍协议盟约'), // i18n-ignore (font sample)
+    fonts.load('700 1em "Noto Sans SC"', '开始'), // i18n-ignore (font sample)
+    fonts.load('700 1em Bender', '0123456789'),
+    fonts.load('700 1em Rajdhani', '0123456789'),
+  ].map((p) => p.catch(() => null));
+  await Promise.race([Promise.all(loads), new Promise((r) => setTimeout(r, ms))]);
+}
+
+function installGlobalErrorHandlers() {
+  window.addEventListener('unhandledrejection', (ev) => {
+    const err = ev.reason;
+    // Media autoplay/abort rejections (audio.play() before a user gesture, interrupted loads) are
+    // expected browser behaviour, not app errors: log quietly, never toast.
+    if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) { console.warn('[app] ignored rejection', err.name); return; }
+    console.error('[app] unhandled rejection', err);
+    if (err instanceof NetError) toastError(err);
+    else toast(t('发生意外错误：{error}', { error: describeError(err) }).slice(0, 120), 'error');
+  });
+  window.addEventListener('error', (ev) => {
+    if (!(ev instanceof ErrorEvent)) return; // resource load errors are not script errors
+    console.error('[app] uncaught error', ev.error || ev.message);
+  });
+}
+
+async function boot() {
+  installGlobalErrorHandlers();
+  // touch / hover / fullscreen classes, zoom-gesture blocking, rotation re-layout (ui/device.js, css/devices.css)
+  installDeviceSupport();
+  // A page restored from the back/forward cache has a dead socket and a stale token choice: start over.
+  window.addEventListener('pageshow', (ev) => { if (ev.persisted) location.reload(); });
+  // Pick this tab's reconnect token (asks other live tabs; ≤150 ms) while fonts load.
+  const identityReady = identity.init();
+
+  const pendingJoin = parseRoomParam(location.search);
+  const savedName = sanitizeName(identity.loadName());
+  const entered = identity.wasEntered() && !!savedName;
+  store.set((s) => ({
+    me: { ...s.me, name: savedName },
+    session: { entered },
+    ui: { ...s.ui, pendingJoin },
+  }));
+
+  wireNet();
+  installLoadoutSync({ net });
+  installOwnershipSync({ net });
+  installDiySync({ net });
+  net.attachBrowserHooks();
+  // Audio: unlock on first gesture, BGM follows the route / match phase (js/audio.js).
+  installAudio({ getManifest: () => data.get('assets'), subscribe: store.subscribe, getState: store.get, selectRoute, settings: settingsStore.get() });
+  data.load('assets').catch(() => {});
+  // Warm the data cache in the background (missing files are tolerated).
+  data.loadAll('config').catch(() => {});
+  // Optional local-client art manifest (emotes, tutorial pages, official UI sprites; DESIGN §13).
+  data.load('local').catch(() => {});
+
+  const connectWhenReady = identityReady.then(() => {
+    if (entered) net.setName(savedName);
+    else net.connect();
+  });
+  // the language (and its UI translations) before the first render: no Chinese flash for an English player
+  const langReady = initLang().catch((err) => console.warn('[app] language setup failed', err));
+  await Promise.all([waitForFonts(1200), connectWhenReady, langReady]);
+  const root = document.getElementById('app');
+  render(html`<${App} />`, root);
+
+  const splash = document.getElementById('boot');
+  if (splash) {
+    splash.classList.add('is-done');
+    setTimeout(() => splash.remove(), 300);
+  }
+  globalThis.__SP__ = { ...PLUGIN_API, plugins: [] };
+  // A page keeps the modules it imported at load time for its whole lifetime, so a deploy cannot reach an open tab
+  // (ui/buildGuard.js): watch `/healthz.build`. Outside a match the page reloads itself; during a match the guard says
+  // so instead (the connection banner offers 刷新页面) and reloads once the match — settlement screen included — is over,
+  // so a running game is never thrown away.
+  try {
+    startBuildGuard({
+      inMatch: () => selectRoute(store.get()) === 'game',
+      onStale: ({ waiting }) => { if (waiting) store.patch('ui', { buildStale: true }); },
+    });
+  } catch (err) {
+    console.warn('[app] build guard failed to start', err);
+  }
+  // MOD / plugin system: discover and load user plugins from /mod (non-blocking; failures are isolated).
+  loadPlugins().catch((err) => console.warn('[plugins] load error', err));
+}
+
+boot().catch((err) => {
+  console.error('[app] boot failed', err);
+  const el = document.getElementById('boot-err');
+  if (el) el.textContent = t('启动失败，请刷新页面重试');
+});

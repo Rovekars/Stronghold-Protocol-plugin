@@ -1,0 +1,1 @@
+export const loadPref=()=>({});export const savePref=()=>{};

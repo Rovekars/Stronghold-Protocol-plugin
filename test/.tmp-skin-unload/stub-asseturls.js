@@ -1,0 +1,1 @@
+export const setSkinOverride=(...a)=>{globalThis.__skin_set=(globalThis.__skin_set||0)+1;};export const clearSkinOverride=(...a)=>{globalThis.__skin_clear=(globalThis.__skin_clear||0)+1;};export const getSkinOverride=()=>undefined;

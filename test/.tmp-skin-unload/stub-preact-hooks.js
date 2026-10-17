@@ -1,0 +1,1 @@
+export const useState=(v)=>[typeof v==='function'?v():v,()=>{}];export const useEffect=()=>{};export const useMemo=(f)=>(typeof f==='function'?f():f);export const useRef=()=>({current:null});

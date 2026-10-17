@@ -1,0 +1,1 @@
+export const MODS_EVENT='sp.mods.test';let offMap={};export const __setOff=(m)=>{offMap=m||{};};export const modsOffMap=()=>offMap;
